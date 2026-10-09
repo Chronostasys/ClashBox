@@ -434,8 +434,8 @@ export class YamlUtils {
       let decodedStr = "";
       const trimmed = rawContent.trim();
 
-      // 如果已经是明文协议头，不需要 Base64 解码
-      if (trimmed.startsWith('vmess://') || trimmed.startsWith('ss://') || trimmed.startsWith('trojan://')) {
+      // 如果已经是明文协议头，不需要 Base64 解码（vless 一并支持）
+      if (trimmed.startsWith('vmess://') || trimmed.startsWith('vless://') || trimmed.startsWith('ss://') || trimmed.startsWith('trojan://')) {
         decodedStr = trimmed;
       } else {
         // 尝试 Base64 解码
@@ -450,8 +450,9 @@ export class YamlUtils {
         }
       }
 
-      // 验证解码后的内容是否包含通用协议头
-      if (!decodedStr.includes('vmess://') && !decodedStr.includes('ss://') && !decodedStr.includes('trojan://')) {
+      // 验证解码后的内容是否包含通用协议头（vless 一并支持）
+      if (!decodedStr.includes('vmess://') && !decodedStr.includes('vless://')
+        && !decodedStr.includes('ss://') && !decodedStr.includes('trojan://')) {
         return null;
       }
 
@@ -464,68 +465,26 @@ export class YamlUtils {
         const trimLine = line.trim();
         if (!trimLine) continue;
 
-        if (trimLine.startsWith('vmess://')) {
-          try {
-            const b64Str = trimLine.replace('vmess://', '');
-            // VMess 的 Base64 经常缺失填充符 '='，手动补齐避免解码失败
-            const pad = b64Str.length % 4 === 0 ? '' : '='.repeat(4 - b64Str.length % 4);
-
-            // 同样注意 util.Base64Helper 的使用
-            const base64Helper = new util.Base64Helper();
-            const jsonStr = util.TextDecoder.create('utf-8').decodeToString(base64Helper.decodeSync(b64Str + pad));
-
-            const vmessObj = JSON.parse(jsonStr);
-            const name = vmessObj.ps || `VMess-${proxyNames.length}`;
-
-            const proxy: Record<string, Object> = {
-              name: name,
-              type: "vmess",
-              server: vmessObj.add,
-              port: parseInt(vmessObj.port) || 443,
-              uuid: vmessObj.id,
-              alterId: parseInt(vmessObj.aid) || 0,
-              cipher: vmessObj.scy || "auto",
-              udp: true
-            };
-
-            // 处理传输层 (network: ws / grpc 等)
-            if (vmessObj.net === "ws") {
-              proxy.network = "ws";
-              proxy["ws-opts"] = {
-                path: vmessObj.path || "/",
-                headers: { Host: vmessObj.host || "" }
-              };
-            } else if (vmessObj.net === "grpc") {
-              proxy.network = "grpc";
-              proxy["grpc-opts"] = { "grpc-service-name": vmessObj.path || "" };
-            }
-
-            // 处理 TLS
-            if (vmessObj.tls === "tls") {
-              proxy.tls = true;
-              if (vmessObj.sni) {
-                proxy.servername = vmessObj.sni;
-              }
-              proxy["skip-cert-verify"] = false;
-            }
-
-            proxyList.push(proxy);
-            proxyNames.push(name);
-          } catch (e) {
-            console.warn("解析单条 vmess 链接失败", e);
+        // 统一分发：vmess / vless / ss / trojan（原来只有 vmess 真解析，ss/trojan 是写死的假节点）
+        let proxy: Record<string, Object> | null = null;
+        try {
+          if (trimLine.startsWith('vmess://')) {
+            proxy = YamlUtils.buildVmessProxy(trimLine, proxyNames.length);
+          } else if (trimLine.startsWith('vless://')) {
+            proxy = YamlUtils.buildVlessProxy(trimLine, proxyNames.length);
+          } else if (trimLine.startsWith('ss://')) {
+            proxy = YamlUtils.buildSSProxy(trimLine, proxyNames.length);
+          } else if (trimLine.startsWith('trojan://')) {
+            proxy = YamlUtils.buildTrojanProxy(trimLine, proxyNames.length);
           }
-        } else if (trimLine.startsWith('ss://')) {
-          // Shadowsocks 解析逻辑略 (SIP002)
-          const name = `SS-Node-${proxyNames.length}`;
-          // TODO: 完善 SS 解析
-          proxyList.push({ name: name, type: "ss", server: "0.0.0.0", port: 1, cipher: "aes-256-gcm", password: "password" });
-          proxyNames.push(name);
-        } else if (trimLine.startsWith('trojan://')) {
-          // Trojan 解析逻辑略
-          const name = `Trojan-Node-${proxyNames.length}`;
-          // TODO: 完善 Trojan 解析
-          proxyList.push({ name: name, type: "trojan", server: "0.0.0.0", port: 1, password: "password" });
-          proxyNames.push(name);
+        } catch (e) {
+          console.warn(`解析节点失败(${trimLine.substring(0, 14)}...):`, e);
+        }
+        if (proxy !== null) {
+          const uniq = YamlUtils.uniqueProxyName(proxy['name'] as string, proxyNames);
+          proxy['name'] = uniq;
+          proxyList.push(proxy);
+          proxyNames.push(uniq);
         }
       }
 
@@ -566,6 +525,266 @@ export class YamlUtils {
    * @param deleteRules 需要删除的规则数组
    * @returns 处理后的最终 YAML 字符串
    */
+// ===== 分享链接解析辅助（2026-10 补：vless/ss/trojan 真解析 + 小火箭 vmess 兼容） =====
+
+/** 解析 "k=v&k2=v2" 查询串（值做一次 decodeURIComponent） */
+private static parseQuery(q: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!q) return out;
+  for (const seg of q.split('&')) {
+    if (!seg) continue;
+    const i = seg.indexOf('=');
+    const k = i < 0 ? seg : seg.substring(0, i);
+    const v = i < 0 ? '' : seg.substring(i + 1);
+    out[k] = YamlUtils.decodeSafe(v);
+  }
+  return out;
+}
+
+private static decodeSafe(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch (e) {
+    return s;
+  }
+}
+
+/** 拆 "user@host:port" / "host:port" / "[v6]:port"，返回 [user, host, port] */
+private static splitUserHostPort(s: string): Array<string> {
+  const at = s.lastIndexOf('@');
+  const user = at >= 0 ? s.substring(0, at) : '';
+  const hp = at >= 0 ? s.substring(at + 1) : s;
+  let host = hp;
+  let port = '443';
+  if (hp.startsWith('[')) {
+    const j = hp.indexOf(']');
+    if (j > 0) {
+      host = hp.substring(1, j);
+      const rest = hp.substring(j + 1);
+      if (rest.startsWith(':')) port = rest.substring(1);
+    }
+  } else {
+    const c = hp.lastIndexOf(':');
+    if (c > 0) {
+      host = hp.substring(0, c);
+      port = hp.substring(c + 1);
+    }
+  }
+  return [user, host, port];
+}
+
+/** 宽容的 base64 解码：自动补 '='、兼容 URL-safe 字母表 */
+private static decodeB64Loose(s: string): string {
+  const t = s.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = t.length % 4 === 0 ? '' : '='.repeat(4 - t.length % 4);
+  const helper = new util.Base64Helper();
+  return util.TextDecoder.create('utf-8').decodeToString(helper.decodeSync(t + pad));
+}
+
+private static uniqueProxyName(base: string, used: Array<string>): string {
+  const b = (base && base.length > 0) ? base : 'PROXY';
+  let name = b;
+  let n = 2;
+  while (used.indexOf(name) >= 0) {
+    name = `${b}-${n}`;
+    n++;
+  }
+  return name;
+}
+
+/**
+ * vmess:// 两种格式：
+ *  ① base64(JSON)                       —— V2RayN 标准
+ *  ② base64("cipher:uuid@host:port")?query…  —— 小火箭(Shadowrocket) 格式（原先完全没处理）
+ */
+private static buildVmessProxy(line: string, idx: number): Record<string, Object> | null {
+  let payload = line.substring('vmess://'.length);
+  const qi = payload.indexOf('?');
+  const query: Record<string, string> = qi >= 0 ? YamlUtils.parseQuery(payload.substring(qi + 1)) : {};
+  if (qi >= 0) payload = payload.substring(0, qi);
+
+  let o: Record<string, Object> = {};
+  const txt = YamlUtils.decodeB64Loose(payload).trim();
+  if (txt.startsWith('{')) {
+    o = JSON.parse(txt) as Record<string, Object>;
+  } else {
+    // 小火箭式：auto:uuid@host:port
+    const parts = YamlUtils.splitUserHostPort(txt);
+    const user = parts[0];
+    const ci = user.indexOf(':');
+    o['scy'] = ci > 0 ? user.substring(0, ci) : 'auto';
+    o['id'] = ci > 0 ? user.substring(ci + 1) : user;
+    o['add'] = parts[1];
+    o['port'] = parts[2];
+    o['ps'] = query['remarks'] ? query['remarks'] : `VMess-${idx}`;
+    if (query['obfs'] === 'websocket' || query['obfs'] === 'ws') o['net'] = 'ws';
+    if (query['path']) o['path'] = query['path'];
+    if (query['obfsParam']) o['host'] = query['obfsParam'];
+    if (query['tls'] === '1') o['tls'] = 'tls';
+    if (query['peer']) o['sni'] = query['peer'];
+    if (query['alterId']) o['aid'] = query['alterId'];
+  }
+
+  const proxy: Record<string, Object> = {
+    name: (o['ps'] as string) || `VMess-${idx}`,
+    type: 'vmess',
+    server: o['add'],
+    port: parseInt(o['port'] as string) || 443,
+    uuid: o['id'],
+    alterId: parseInt(o['aid'] as string) || 0,
+    cipher: (o['scy'] as string) || 'auto',
+    udp: true
+  };
+  const net = o['net'] as string;
+  if (net === 'ws') {
+    proxy.network = 'ws';
+    proxy['ws-opts'] = {
+      path: (o['path'] as string) || '/',
+      headers: { Host: (o['host'] as string) || '' }
+    };
+  } else if (net === 'grpc') {
+    proxy.network = 'grpc';
+    proxy['grpc-opts'] = { 'grpc-service-name': (o['path'] as string) || '' };
+  }
+  if (o['tls'] === 'tls') {
+    proxy.tls = true;
+    if (o['sni']) proxy.servername = o['sni'];
+  }
+  if (!proxy.server || !proxy.uuid) return null;
+  return proxy;
+}
+
+/** vless://（支持 security=reality/tls、flow=xtls-rprx-vision、ws/grpc/tcp） */
+private static buildVlessProxy(line: string, idx: number): Record<string, Object> | null {
+  const rest = line.substring('vless://'.length);
+  const hi = rest.indexOf('#');
+  const name = hi >= 0 ? YamlUtils.decodeSafe(rest.substring(hi + 1)) : '';
+  const noFrag = hi >= 0 ? rest.substring(0, hi) : rest;
+  const qi = noFrag.indexOf('?');
+  const q: Record<string, string> = qi >= 0 ? YamlUtils.parseQuery(noFrag.substring(qi + 1)) : {};
+  const parts = YamlUtils.splitUserHostPort(qi >= 0 ? noFrag.substring(0, qi) : noFrag);
+  const proxy: Record<string, Object> = {
+    name: name || `VLESS-${idx}`,
+    type: 'vless',
+    server: parts[1],
+    port: parseInt(parts[2]) || 443,
+    uuid: parts[0],
+    udp: true
+  };
+  const net = q['type'] || q['net'] || 'tcp';
+  if (net === 'ws') {
+    proxy.network = 'ws';
+    proxy['ws-opts'] = {
+      path: q['path'] || '/',
+      headers: { Host: q['host'] || q['sni'] || '' }
+    };
+  } else if (net === 'grpc') {
+    proxy.network = 'grpc';
+    proxy['grpc-opts'] = { 'grpc-service-name': q['serviceName'] || '' };
+  } else {
+    proxy.network = 'tcp';
+  }
+  if (q['flow']) proxy.flow = q['flow'];
+  const security = q['security'] || (q['pbk'] ? 'reality' : 'none');
+  if (security === 'reality') {
+    proxy.tls = true;
+    proxy.servername = q['sni'] || q['peer'] || '';
+    proxy['client-fingerprint'] = q['fp'] || 'chrome';
+    const ro: Record<string, string> = { 'public-key': q['pbk'] || '', 'short-id': q['sid'] || '' };
+    if (q['spx']) ro['spider-x'] = q['spx'];
+    proxy['reality-opts'] = ro;
+  } else if (security === 'tls' || q['tls'] === '1' || q['tls'] === 'tls') {
+    proxy.tls = true;
+    if (q['sni'] || q['peer']) proxy.servername = q['sni'] || q['peer'];
+    if (q['allowInsecure'] === '1') proxy['skip-cert-verify'] = true;
+    if (q['fp']) proxy['client-fingerprint'] = q['fp'];
+  }
+  if (!proxy.server || !proxy.uuid) return null;
+  return proxy;
+}
+
+/** ss://（SIP002：ss://b64(method:pass)@host:port#name；兼容 legacy 全 base64） */
+private static buildSSProxy(line: string, idx: number): Record<string, Object> | null {
+  const rest = line.substring('ss://'.length);
+  const hi = rest.indexOf('#');
+  const name = hi >= 0 ? YamlUtils.decodeSafe(rest.substring(hi + 1)) : '';
+  let body = hi >= 0 ? rest.substring(0, hi) : rest;
+  let q: Record<string, string> = {};
+  const qi = body.indexOf('?');
+  if (qi >= 0) {
+    q = YamlUtils.parseQuery(body.substring(qi + 1));
+    body = body.substring(0, qi);
+  }
+  let userinfo = '';
+  let host = '';
+  let port = '8388';
+  const at = body.lastIndexOf('@');
+  if (at >= 0) {
+    userinfo = body.substring(0, at);
+    const hp = YamlUtils.splitUserHostPort(body.substring(at));
+    host = hp[1];
+    port = hp[2];
+    if (userinfo.indexOf(':') < 0) {
+      try {
+        userinfo = YamlUtils.decodeB64Loose(userinfo);
+      } catch (e) {
+        // 保底：原样使用
+      }
+    }
+  } else {
+    const all = YamlUtils.decodeB64Loose(body);
+    const a2 = all.lastIndexOf('@');
+    userinfo = a2 >= 0 ? all.substring(0, a2) : all;
+    const hp = YamlUtils.splitUserHostPort(a2 >= 0 ? all.substring(a2) : all);
+    host = hp[1];
+    port = hp[2];
+  }
+  const ci = userinfo.indexOf(':');
+  const proxy: Record<string, Object> = {
+    name: name || `SS-${idx}`,
+    type: 'ss',
+    server: host,
+    port: parseInt(port) || 8388,
+    cipher: ci > 0 ? userinfo.substring(0, ci) : 'aes-256-gcm',
+    password: ci > 0 ? userinfo.substring(ci + 1) : userinfo,
+    udp: true
+  };
+  if (q['plugin']) proxy.plugin = q['plugin'];
+  if (!proxy.server || !proxy.password) return null;
+  return proxy;
+}
+
+/** trojan://password@host:port?sni=&type=ws&path=&host=#name */
+private static buildTrojanProxy(line: string, idx: number): Record<string, Object> | null {
+  const rest = line.substring('trojan://'.length);
+  const hi = rest.indexOf('#');
+  const name = hi >= 0 ? YamlUtils.decodeSafe(rest.substring(hi + 1)) : '';
+  const noFrag = hi >= 0 ? rest.substring(0, hi) : rest;
+  const qi = noFrag.indexOf('?');
+  const q: Record<string, string> = qi >= 0 ? YamlUtils.parseQuery(noFrag.substring(qi + 1)) : {};
+  const parts = YamlUtils.splitUserHostPort(qi >= 0 ? noFrag.substring(0, qi) : noFrag);
+  const proxy: Record<string, Object> = {
+    name: name || `Trojan-${idx}`,
+    type: 'trojan',
+    server: parts[1],
+    port: parseInt(parts[2]) || 443,
+    password: parts[0],
+    udp: true
+  };
+  if (q['sni'] || q['peer']) proxy.sni = q['sni'] || q['peer'];
+  if (q['allowInsecure'] === '1') proxy['skip-cert-verify'] = true;
+  const net = q['type'] || 'tcp';
+  if (net === 'ws') {
+    proxy.network = 'ws';
+    proxy['ws-opts'] = { path: q['path'] || '/', headers: { Host: q['host'] || '' } };
+  } else if (net === 'grpc') {
+    proxy.network = 'grpc';
+    proxy['grpc-opts'] = { 'grpc-service-name': q['serviceName'] || '' };
+  }
+  if (!proxy.server || !proxy.password) return null;
+  return proxy;
+}
+
 /**
  * 从 YAML 配置内容中提取 MATCH 规则的目标策略
  * @param yamlContent 原始 YAML 字符串

@@ -167,14 +167,20 @@ export class Profile {
           }
 
           const convertedYaml = YamlUtils.convertUniversalToClashYaml(configContent);
-        // 打印转换结果，确认是否走进了转换逻辑
-        if (convertedYaml) {
-          console.info(`[Profile] UpdateConfig Base64/Universal 转换成功，已生成 Clash YAML`);
-        } else {
-          console.info(`[Profile] UpdateConfig Base64/Universal 转换返回 null，将使用原始内容`);
-        }
+          // 打印转换结果，确认是否走进了转换逻辑
+          if (convertedYaml) {
+            console.info(`[Profile] UpdateConfig Base64/Universal 转换成功，已生成 Clash YAML`);
+          } else {
+            // 既不是分享链接、也不像 Clash YAML：明确报错，不要原文硬喂内核
+            // （否则内核只会回一句 yaml: unmarshal errors: line 1: cannot unmarshal !!str `dm1lc3M…` into config.RawConfig）
+            const looksClashYaml = trimmedStr.includes('proxies:') || trimmedStr.includes('proxy-groups:');
+            console.info(`[Profile] UpdateConfig Base64/Universal 转换返回 null，looksClashYaml=${looksClashYaml}`);
+            if (!looksClashYaml) {
+              throw new Error(`订阅内容既不是 Clash YAML，也无法解析为节点列表（可能是不受支持的分享链接或错误页）。前 60 字符：${trimmedStr.substring(0, 60)}`);
+            }
+          }
 
-          let finalStr = convertedYaml ? convertedYaml : configContent;
+          const finalStr = convertedYaml ? convertedYaml : configContent;
 
           await this.save(finalStr, async (config)=> await socketProxy.vailConfig(config), customRules, deleteRules);
         // 清理备份配置
